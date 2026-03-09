@@ -21,6 +21,7 @@ from jamma.kinship.compute import (
     compute_kinship_streaming,
     compute_loco_kinship,
     compute_standardized_kinship,
+    compute_kinship_from_paint_sparse,
 )
 from jamma.kinship.io import (
     read_kinship_matrix,
@@ -42,6 +43,7 @@ __all__ = [
     "compute_kinship_streaming",
     "compute_loco_kinship",
     "compute_standardized_kinship",
+    "compute_kinship_from_paint_sparse",
     "get_chromosome_partitions",
     "impute_and_center",
     "impute_center_and_standardize",

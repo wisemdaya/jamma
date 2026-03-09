@@ -52,6 +52,8 @@ from jamma.io.plink import (
 from jamma.kinship.missing import impute_and_center, impute_center_and_standardize
 from jamma.utils import chr_sort_key
 
+import gzip
+
 
 def _ensure_float64(arr: np.ndarray) -> np.ndarray:
     """Return arr as float64, copying only when the dtype differs."""
@@ -708,6 +710,163 @@ def compute_kinship_streaming(
 
     elapsed = time.perf_counter() - start_time
     logger.info(f"Kinship matrix computed in {elapsed:.2f}s")
+
+    return K
+
+
+# ---------------------------------------------------------------------------
+# paintSparse kinship helper
+# ---------------------------------------------------------------------------
+
+def _read_fam_sample_ids(fam_path: Path) -> np.ndarray:
+    """Read PLINK .fam file and return array of (FID, IID) strings.
+
+    The returned array has shape (n_samples, 2). Empty lines are skipped.
+    This utility is intentionally minimal to avoid importing PLINK readers when
+    only the sample order (and count) is required.
+    """
+    ids: list[tuple[str, str]] = []
+    with open(fam_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            if len(parts) < 2:
+                raise ValueError(
+                    f"Invalid .fam line (expected at least 2 columns): '{line.strip()}'"
+                )
+            ids.append((parts[0], parts[1]))
+    if not ids:
+        raise ValueError(f".fam file appears empty: {fam_path}")
+    return np.array(ids, dtype="<U")
+
+
+def compute_kinship_from_paint_sparse(
+    chunklength_paths: Path | str | list[Path | str],
+    fam_path: Path | str,
+    paint_sample_ids: np.ndarray | None = None,
+    divide_by: float | None = None,
+) -> np.ndarray:
+    """Construct kinship (GRM) from paintSparse chunk‐length output files.
+
+    PaintSparse produces sparse 3-column files ("chr$i.chunklengths.s.out.gz")
+    where each row contains ``IND1 IND2 LENGTH``. IND* are **one-based**
+    individual indices corresponding to the order of samples in the input VCF
+    provided to PBWTpaint. The third column records the total chunk length
+    copied from IND2 by IND1 in units of SNPs (which is typically converted to
+    centimorgans in a downstream weighting step).
+
+    JAMMA can interpret these outputs as a kinship matrix by summing the
+    reported lengths for each pair of individuals. The returned matrix has
+    shape (n_samples, n_samples) and is ordered to match the sample order in a
+    PLINK ``.fam`` file (row/column i corresponds to the i-th line of ``fam``).
+
+    Args:
+        chunklength_paths: A path (or iterable of paths) pointing to one or
+            more paintSparse output files. Relative or glob patterns are
+            accepted; directories are not recursively searched. Files may be
+            gzipped (".gz" extension) or plain text. If a single path is
+            passed it will be treated as a one-element list.
+        fam_path: Path to a PLINK ``.fam`` file describing the same set of
+            individuals. The number of lines (samples) determines the size of
+            the resulting kinship matrix and provides the canonical ordering.
+        paint_sample_ids: Optional array of sample identifiers in the order
+            used by paintSparse. Each element may be a tuple ``(FID, IID)`` or
+            a single string IID; the array length must equal the number of
+            samples. When provided, the function will reorder rows/columns so
+            that paintSparse indices are matched to their position in the
+            ``.fam`` file. If ``None`` (default) an identity mapping is
+            assumed, i.e. paintSparse used the same sample order as ``.fam``.
+        divide_by: Optional scalar. If given, the final matrix is divided by
+            this value. This is convenient for normalising by the total
+            genetic length (for example ~3545.04 cM in the standard map).
+
+    Returns:
+        ``np.ndarray`` of shape ``(n_samples, n_samples)`` containing the
+        symmetrized kinship matrix (covariance matrix) derived from the aggregated
+        chunk lengths. The matrix is symmetric, and diagonal entries reflect
+        self-copying if those values are present in the input files.
+
+    Raises:
+        ValueError: If the ``.fam`` file is empty, if sample counts mismatch,
+            if a paintSparse sample identifier cannot be found in the fam
+            ordering, or if a chunklength file contains indices outside the
+            expected range.
+    """
+    # Normalize inputs to lists of paths
+    if isinstance(chunklength_paths, (str, Path)):
+        paths = [Path(chunklength_paths)]
+    else:
+        paths = [Path(p) for p in chunklength_paths]
+
+    fam_path = Path(fam_path)
+    fam_ids = _read_fam_sample_ids(fam_path)
+    n_samples = fam_ids.shape[0]
+
+    # build mapping from paint index -> fam index
+    if paint_sample_ids is not None:
+        paint_arr = np.asarray(paint_sample_ids)
+        if paint_arr.shape[0] != n_samples:
+            raise ValueError(
+                "paint_sample_ids length does not match number of .fam samples"
+            )
+        # mapping logic: handle 1D IID list or 2D (FID,IID) list
+        if paint_arr.ndim == 1:
+            fam_iids = fam_ids[:, 1]
+            mapping = np.empty(n_samples, dtype=np.int64)
+            for i, pid in enumerate(paint_arr):
+                matches = np.where(fam_iids == pid)[0]
+                if matches.size == 0:
+                    raise ValueError(f"Paint sample '{pid}' not found in fam")
+                mapping[i] = matches[0]
+        else:
+            fam_map = {tuple(row): idx for idx, row in enumerate(fam_ids)}
+            mapping = np.empty(n_samples, dtype=np.int64)
+            for i, row in enumerate(paint_arr):
+                key = tuple(row)
+                if key not in fam_map:
+                    raise ValueError(f"Paint sample {row} not found in fam")
+                mapping[i] = fam_map[key]
+    else:
+        mapping = np.arange(n_samples, dtype=np.int64)
+
+    # allocate kinship accumulator
+    K = np.zeros((n_samples, n_samples), dtype=np.float64)
+
+    # parse each file and add contributions
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"PaintSparse file not found: {path}")
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt") as f:
+            for line in f:
+                parts = line.split()
+                if not parts:
+                    continue
+                if len(parts) < 3:
+                    continue  # ignore malformed lines silently
+                try:
+                    i = int(parts[0]) - 1
+                    j = int(parts[1]) - 1
+                    val = float(parts[2])
+                except ValueError:
+                    # skip lines that don't parse as numbers
+                    continue
+                if i < 0 or j < 0 or i >= n_samples or j >= n_samples:
+                    raise ValueError(
+                        f"Index out of bounds in {path}: {i+1}, {j+1}"
+                    )
+                pi = mapping[i]
+                pj = mapping[j]
+                K[pi, pj] += val
+
+    if divide_by is not None:
+        K = K / divide_by
+
+    # Symmetrize the matrix to create covariance matrix: (K + K.T) / 2
+    # This accounts for directed donor/recipient sharing in paintSparse output
+    K = (K + K.T) / 2
 
     return K
 
