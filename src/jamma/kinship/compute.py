@@ -25,7 +25,7 @@ from __future__ import annotations
 import gc
 import time
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -743,7 +743,7 @@ def _read_fam_sample_ids(fam_path: Path) -> np.ndarray:
 
 
 def compute_kinship_from_paint_sparse(
-    chunklength_paths: Path | str | list[Path | str],
+    path_weight_pairs: Sequence[tuple[Path | str, float]],
     fam_path: Path | str,
     paint_sample_ids: np.ndarray | None = None,
     divide_by: float | None = None,
@@ -762,12 +762,18 @@ def compute_kinship_from_paint_sparse(
     shape (n_samples, n_samples) and is ordered to match the sample order in a
     PLINK ``.fam`` file (row/column i corresponds to the i-th line of ``fam``).
 
+    This implementation mirrors the behaviour of
+    ``combine_chunklength.cpp`` from the SparsePainter repository: each
+    input file may be scaled by an optional weight prior to aggregation.  By
+    default all files are treated equally (weight=1), and the final matrix may
+    still be normalised with ``divide_by``.
+
     Args:
-        chunklength_paths: A path (or iterable of paths) pointing to one or
-            more paintSparse output files. Relative or glob patterns are
-            accepted; directories are not recursively searched. Files may be
-            gzipped (".gz" extension) or plain text. If a single path is
-            passed it will be treated as a one-element list.
+        path_weight_pairs: Sequence of ``(path, weight)`` tuples describing
+            the chunklength files to include and the scalar weight to apply to
+            each. ``path`` may be a string or ``Path``; it must name an exact
+            existing file – glob patterns or wildcards are disallowed.  A bare
+            path string is equivalent to ``(path, 1.0)``.
         fam_path: Path to a PLINK ``.fam`` file describing the same set of
             individuals. The number of lines (samples) determines the size of
             the resulting kinship matrix and provides the canonical ordering.
@@ -784,21 +790,43 @@ def compute_kinship_from_paint_sparse(
 
     Returns:
         ``np.ndarray`` of shape ``(n_samples, n_samples)`` containing the
-        symmetrized kinship matrix (covariance matrix) derived from the aggregated
-        chunk lengths. The matrix is symmetric, and diagonal entries reflect
-        self-copying if those values are present in the input files.
+        symmetrized kinship matrix (covariance matrix) derived from the
+        weighted, aggregated chunk lengths. The matrix is symmetric, and
+        diagonal entries reflect self-copying if those values are present in
+        the input files.
 
     Raises:
         ValueError: If the ``.fam`` file is empty, if sample counts mismatch,
             if a paintSparse sample identifier cannot be found in the fam
-            ordering, or if a chunklength file contains indices outside the
-            expected range.
+            ordering, if a path-weight entry is malformed, if a weight is not
+            a number, or if an entry contains glob metacharacters.
     """
-    # Normalize inputs to lists of paths
-    if isinstance(chunklength_paths, (str, Path)):
-        paths = [Path(chunklength_paths)]
-    else:
-        paths = [Path(p) for p in chunklength_paths]
+    # Interpret ``path_weight_pairs`` as an iterable of
+    # (path, weight) tuples.  Plain strings/Paths are accepted as shorthand
+    # for a weight of 1.0 to preserve convenience.
+    entries: list[tuple[Path, float]] = []
+    for item in path_weight_pairs:
+        if isinstance(item, (str, Path)):
+            # bare path -> weight 1.0
+            path_str = str(item)
+            wt = 1.0
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            path_str, wt = item
+            wt = float(wt)
+        else:
+            raise ValueError(
+                "each entry must be (path, weight) or a bare path string"
+            )
+
+        # require that the provided path contains no glob metacharacters
+        if any(ch in path_str for ch in "*?[]"):
+            raise ValueError(
+                f"path '{path_str}' contains wildcard characters; full path required"
+            )
+        entries.append((Path(path_str), wt))
+
+    paths = [p for p, _ in entries]
+    weights_list = [w for _, w in entries]
 
     fam_path = Path(fam_path)
     fam_ids = _read_fam_sample_ids(fam_path)
@@ -834,8 +862,8 @@ def compute_kinship_from_paint_sparse(
     # allocate kinship accumulator
     K = np.zeros((n_samples, n_samples), dtype=np.float64)
 
-    # parse each file and add contributions
-    for path in paths:
+    # parse each file and add weighted contributions
+    for path, wt in zip(paths, weights_list, strict=True):
         if not path.exists():
             raise FileNotFoundError(f"PaintSparse file not found: {path}")
         opener = gzip.open if str(path).endswith(".gz") else open
@@ -849,7 +877,7 @@ def compute_kinship_from_paint_sparse(
                 try:
                     i = int(parts[0]) - 1
                     j = int(parts[1]) - 1
-                    val = float(parts[2])
+                    val = float(parts[2]) * wt
                 except ValueError:
                     # skip lines that don't parse as numbers
                     continue
@@ -867,6 +895,11 @@ def compute_kinship_from_paint_sparse(
     # Symmetrize the matrix to create covariance matrix: (K + K.T) / 2
     # This accounts for directed donor/recipient sharing in paintSparse output
     K = (K + K.T) / 2
+
+    # ensure diagonal reflects the maximum sharing for each individual
+    # otherwise the matrix diagaonal is zero and the matrix is not positive semi-definite, 
+    # which causes issues for eigendecomposition
+    np.fill_diagonal(K, np.max(K, axis=1))
 
     return K
 
