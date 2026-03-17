@@ -741,6 +741,32 @@ def _read_fam_sample_ids(fam_path: Path) -> np.ndarray:
         raise ValueError(f".fam file appears empty: {fam_path}")
     return np.array(ids, dtype="<U")
 
+def _stabilize_kinship(K, alpha=1e-4):
+    """
+    K: Symmetric matrix (X + X.T) / 2
+    alpha: The 'nudge' factor. 
+           Start with 1e-4. If GEMMA still complains, try 1e-3.
+    """
+    n = K.shape[0]
+    
+    # 1. Double Centering
+    # Forces the model to look at kinship relative to background breed averages.
+    row_means = np.mean(K, axis=1, keepdims=True)
+    col_means = np.mean(K, axis=0, keepdims=True)
+    grand_mean = np.mean(K)
+    K_centered = K - row_means - col_means + grand_mean
+    
+    # 2. Scaling (Optional but recommended for GEMMA)
+    # Scales the matrix so the average diagonal element is 1.
+    scaling_factor = np.trace(K_centered) / n
+    K_scaled = K_centered / scaling_factor
+    
+    # 3. Shrinkage (The 'Nudge')
+    # This pushes eigenvalues away from zero/negative into positive space.
+    # K_final = (1 - alpha) * K_scaled + alpha * I
+    K_final = (1 - alpha) * K_scaled + alpha * np.eye(n)
+    
+    return K_final
 
 def compute_kinship_from_paint_sparse(
     path_weight_pairs: Sequence[tuple[Path | str, float]],
@@ -900,6 +926,8 @@ def compute_kinship_from_paint_sparse(
     # otherwise the matrix diagaonal is zero and the matrix is not positive semi-definite, 
     # which causes issues for eigendecomposition
     np.fill_diagonal(K, np.max(K, axis=1))
+
+    K = _stabilize_kinship(K)
 
     return K
 
